@@ -25,7 +25,6 @@ import {
   connectFrameDecode,
 } from "./protobuf.mjs";
 import { ToolExecutor } from "./executor.mjs";
-import { extractKey } from "./extract-key.mjs";
 import { scoreDirectories, tokenize as tokenizeBM25 } from "./directory-scorer.mjs";
 
 // ─── Error Classification ──────────────────────────────────
@@ -655,33 +654,14 @@ function getToolDefinitions(maxCommands = 8) {
 // ─── Credentials ───────────────────────────────────────────
 
 /**
- * Auto-discover Windsurf API key from local installation.
- * @returns {Promise<string|null>}
+ * Get API key from the explicit option or supported environment variables.
+ * @returns {string}
  */
-async function autoDiscoverApiKey() {
-  try {
-    const result = await extractKey();
-    if (result.api_key && result.api_key.startsWith("sk-")) {
-      return result.api_key;
-    }
-  } catch {
-    // Extraction failed
-  }
-  return null;
-}
-
-/**
- * Get API key from env var or auto-discovery.
- * @returns {Promise<string>}
- */
-async function getApiKey() {
-  const key = process.env.WINDSURF_API_KEY;
+function getApiKey() {
+  const key = process.env.FAST_CONTEXT_API_KEY?.trim() || process.env.WINDSURF_API_KEY?.trim();
   if (key) return key;
-  const discovered = await autoDiscoverApiKey();
-  if (discovered) return discovered;
   throw new Error(
-    "Windsurf API Key not found. Set WINDSURF_API_KEY env var or ensure Windsurf is logged in. " +
-    "Run extract-key.mjs to see extraction methods."
+    "Windsurf API Key not found. Pass apiKey explicitly or set FAST_CONTEXT_API_KEY / WINDSURF_API_KEY."
   );
 }
 
@@ -1453,7 +1433,7 @@ function _parseAnswer(xmlText, projectRoot) {
  * @param {Object} opts
  * @param {string} opts.query - Natural language search query
  * @param {string} opts.projectRoot - Project root directory
- * @param {string} [opts.apiKey] - Windsurf API key (auto-discovered if not set)
+ * @param {string} [opts.apiKey] - Explicit Windsurf API key (environment variables are used only when omitted)
  * @param {string} [opts.jwt] - JWT token (auto-fetched if not set)
  * @param {number} [opts.maxTurns=3] - Search rounds
  * @param {number} [opts.maxCommands=8] - Max commands per round
@@ -1491,7 +1471,7 @@ export async function search({
 
   // Get credentials
   if (!apiKey) {
-    apiKey = await getApiKey();
+    apiKey = getApiKey();
   }
   if (!jwt) {
     log("Fetching JWT...");
@@ -1836,7 +1816,7 @@ export async function searchWithContent({
       if (meta.errorCode === "PAYLOAD_TOO_LARGE" || meta.errorCode === "TIMEOUT") {
         errMsg += `\n[hint] Payload/timeout error. Try: reduce tree_depth, reduce max_turns, add exclude_paths, or narrow project_path to a subdirectory.`;
       } else if (meta.errorCode === "AUTH_ERROR") {
-        errMsg += `\n[hint] Authentication error. The API key may be expired or revoked. Run /fast-context-status or /fast-context-config, ensure Windsurf is logged in, or set a fresh WINDSURF_API_KEY.`;
+        errMsg += `\n[hint] Authentication error. The API key may be expired or revoked. Run /fast-context-status or /fast-context-config, or set a fresh FAST_CONTEXT_API_KEY / WINDSURF_API_KEY.`;
       } else if (meta.errorCode === "RATE_LIMITED") {
         errMsg += `\n[hint] Rate limited. Wait a moment and retry.`;
       } else {
@@ -1890,12 +1870,4 @@ export async function searchWithContent({
   }
 
   return parts.join("\n");
-}
-
-/**
- * Extract Windsurf API Key info (for MCP tool use).
- * @returns {Promise<Object>}
- */
-export async function extractKeyInfo(dbPath) {
-  return extractKey(dbPath);
 }

@@ -5,13 +5,11 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 import {
 	deleteStoredConfig,
-	discoverWindsurfDbKey,
 	formatTimeout,
 	getConfigFilePath,
 	hasEnvApiKey,
 	loadConfig,
 	maskSecret,
-	persistApiKey,
 	readStoredConfig,
 	resolveApiKey,
 	type FastContextConfig,
@@ -99,7 +97,6 @@ type UiContext = {
 const CONFIG_ENV_NAMES = [
 	"FAST_CONTEXT_API_KEY",
 	"WINDSURF_API_KEY",
-	"FAST_CONTEXT_DB_PATH",
 	"FAST_CONTEXT_TREE_DEPTH",
 	"FAST_CONTEXT_MAX_TURNS",
 	"FAST_CONTEXT_MAX_COMMANDS",
@@ -216,8 +213,7 @@ function updateConfigStatus(ctx: UiContext): void {
 
 function nextActionText(issues: string[], keyInfo: Awaited<ReturnType<typeof resolveApiKey>>): string {
 	if (issues.length) return "fix config with /fast-context-config";
-	if (!keyInfo.apiKey) return "run /fast-context-config import, set env key, or log in to Windsurf";
-	if (keyInfo.source === "windsurf-db") return "ready; run /fast-context-import-key to persist discovered key";
+	if (!keyInfo.apiKey) return "set env key or run /fast-context-config to enter an API Key";
 	return "ready; use fast_context_search";
 }
 
@@ -235,7 +231,6 @@ function statusPanel(cwd: string, projectRoot: string, config: FastContextConfig
 		section("key", [
 			kv("source", keyInfo.source),
 			kv("masked", maskSecret(keyInfo.apiKey)),
-			kv("dbPath", keyInfo.dbPath || config.dbPath || "auto"),
 			...(keyInfo.error ? [kv("error", keyInfo.error)] : []),
 			...(keyInfo.hint ? [kv("hint", keyInfo.hint)] : []),
 		]),
@@ -291,7 +286,6 @@ const CUSTOM_CANCEL = "__fast_context_custom_cancel__";
 
 const BASIC_CONFIG_FIELDS: ConfigField[] = [
 	{ key: "apiKey", env: "FAST_CONTEXT_API_KEY / WINDSURF_API_KEY", label: "Windsurf API Key", kind: "secret", description: "手动保存 Windsurf API Key。推荐保存到全局配置；项目配置保存 key 需要额外确认。" },
-	{ key: "dbPath", env: "FAST_CONTEXT_DB_PATH", label: "Windsurf state.vscdb 路径", kind: "string", description: "自定义 Windsurf 本地 state.vscdb 路径。留空时按系统默认位置自动查找。", defaultValue: "auto" },
 	{ key: "treeDepth", env: "FAST_CONTEXT_TREE_DEPTH", label: "Repo tree 深度", kind: "number", description: "传给 Fast Context 的仓库树深度。0 表示自动选择，通常最稳。", defaultValue: 0, min: 0, max: 6 },
 	{ key: "maxTurns", env: "FAST_CONTEXT_MAX_TURNS", label: "搜索轮数", kind: "number", description: "远程模型最多推理/搜索轮数。越高越全，但更慢。", defaultValue: 3, min: 1, max: 10 },
 	{ key: "maxCommands", env: "FAST_CONTEXT_MAX_COMMANDS", label: "每轮命令数", kind: "number", description: "每轮允许远程模型请求的本地只读命令数量。", defaultValue: 8, min: 1, max: 20 },
@@ -397,7 +391,7 @@ function fieldChoice(field: ConfigField, config: StoredFastContextConfig): Confi
 			`环境变量：${field.env}`,
 			`配置字段：${String(field.key)}`,
 			`当前值：${formatStoredValue(field, config)} · 默认：${field.defaultValue === undefined ? "无" : field.defaultValue}`,
-			"优先级：环境变量 > 项目 > 全局 > Windsurf DB 自动发现 > 默认",
+			"优先级：环境变量 > 项目 > 全局 > 默认",
 		].join("\n"),
 	};
 }
@@ -407,16 +401,10 @@ async function chooseScope(ctx: UiContext, args: string): Promise<FastContextCon
 	if (direct) return direct;
 	const choice = await selectConfigItem(ctx, "fast-context 配置", [
 		{
-			value: "import-key",
-			label: "自动导入 Windsurf API Key（推荐）",
-			description: "从 Windsurf state.vscdb 读取 key，默认保存到全局配置。",
-			details: "只在人工命令中执行，不会暴露给 LLM。默认保存到 ~/.pi/agent/fast-context.json；项目保存需要额外确认。",
-		},
-		{
 			value: "global",
 			label: "编辑全局配置 (~/.pi/agent/fast-context.json)",
 			description: "默认作用于所有项目，可被项目配置和环境变量覆盖。",
-			details: `编辑：${getConfigFilePath("global", ctx.cwd)}\n推荐把 API Key 存在这里。优先级：环境变量 > 项目 > 全局 > Windsurf DB 自动发现。`,
+			details: `编辑：${getConfigFilePath("global", ctx.cwd)}\n推荐把 API Key 存在这里。优先级：环境变量 > 项目 > 全局 > 默认。`,
 		},
 		{
 			value: "project",
@@ -428,74 +416,11 @@ async function chooseScope(ctx: UiContext, args: string): Promise<FastContextCon
 		{ value: "exit", label: "退出", description: "不修改任何配置。", details: "关闭配置向导。" },
 	]);
 	if (!choice || choice === "exit") return undefined;
-	if (choice === "import-key") {
-		await importWindsurfKeyFlow(ctx);
-		return undefined;
-	}
 	if (choice === "clear") {
 		await clearConfigFlow(ctx, args);
 		return undefined;
 	}
 	return choice === "global" ? "global" : "project";
-}
-
-async function chooseImportScope(ctx: UiContext): Promise<FastContextConfigScope | undefined> {
-	const choice = await selectConfigItem(ctx, "保存自动发现的 Windsurf API Key", [
-		{
-			value: "global",
-			label: "保存到全局配置（推荐）",
-			description: "写入 ~/.pi/agent/fast-context.json，适合跨项目复用。",
-			details: "推荐选择。全局配置不在当前项目仓库内，可被项目配置或环境变量覆盖。写入时会保留已有其他配置字段。",
-		},
-		{
-			value: "project",
-			label: "保存到项目配置（高级 / 有风险）",
-			description: "写入 .pi/fast-context.json，只作用于当前项目。",
-			details: "只有当前项目必须使用独立 key 时才选择。请确认 .pi/ 已被 .gitignore 忽略；Fast Context 内置排除和读取保护会避免读取 .pi/。",
-		},
-		{ value: "cancel", label: "取消", description: "不保存 key。", details: "自动发现结果只会留在本次命令内，不写入配置文件。" },
-	], 8, { custom: false });
-	if (!choice || choice === "cancel") return undefined;
-	return choice === "project" ? "project" : "global";
-}
-
-async function importWindsurfKeyFlow(ctx: UiContext): Promise<void> {
-	const config = loadConfig(ctx.cwd);
-	const discovered = await discoverWindsurfDbKey(config.dbPath);
-	if (!discovered.apiKey) {
-		ctx.ui.notify([
-			"未能从 Windsurf state.vscdb 自动获取 API Key。",
-			`dbPath: ${discovered.dbPath || config.dbPath || "auto"}`,
-			...(discovered.error ? [`error: ${discovered.error}`] : []),
-			...(discovered.hint ? [`hint: ${discovered.hint}`] : []),
-			"",
-			"可先登录 Windsurf 桌面端，或手动设置 FAST_CONTEXT_API_KEY / WINDSURF_API_KEY。",
-		].join("\n"), "warning");
-		return;
-	}
-
-	const scope = await chooseImportScope(ctx);
-	if (!scope) return;
-	const stored = readStoredConfig(scope, ctx.cwd);
-	if (scope === "project") {
-		const ok = await ctx.ui.confirm("确认保存到项目配置？", "项目配置会写入 .pi/fast-context.json。请确认 .pi/ 不会被提交到 Git；推荐优先保存到全局配置。是否继续？");
-		if (!ok) return;
-	}
-	if (stored.apiKey && stored.apiKey !== discovered.apiKey) {
-		const ok = await ctx.ui.confirm("覆盖已有 API Key？", `${scopeName(scope)}配置已有 key：${maskSecret(stored.apiKey)}\n新发现 key：${maskSecret(discovered.apiKey)}\n\n是否覆盖？`);
-		if (!ok) return;
-	}
-
-	const filePath = persistApiKey(scope, ctx.cwd, discovered.apiKey);
-	updateConfigStatus(ctx);
-	ctx.ui.notify([
-		"已保存 Windsurf API Key。",
-		`scope: ${scopeName(scope)}`,
-		`file: ${filePath}`,
-		`key: ${maskSecret(discovered.apiKey)}`,
-		`dbPath: ${discovered.dbPath || "auto"}`,
-		...(hasEnvApiKey() ? ["", "注意：当前环境变量中也设置了 API Key；本次运行仍会优先使用环境变量。"] : []),
-	].join("\n"), "info");
 }
 
 async function clearConfigFlow(ctx: UiContext, args: string): Promise<void> {
@@ -506,13 +431,13 @@ async function clearConfigFlow(ctx: UiContext, args: string): Promise<void> {
 				value: "global",
 				label: "全局配置 (~/.pi/agent/fast-context.json)",
 				description: "删除全局配置文件。",
-				details: `将删除：${getConfigFilePath("global", ctx.cwd)}\n删除后会退回到项目配置、环境变量、Windsurf DB 自动发现或默认值。`,
+				details: `将删除：${getConfigFilePath("global", ctx.cwd)}\n删除后会退回到项目配置、环境变量或默认值。`,
 			},
 			{
 				value: "project",
 				label: "项目配置 (.pi/fast-context.json)",
 				description: "删除当前项目配置文件。",
-				details: `将删除：${getConfigFilePath("project", ctx.cwd)}\n删除后当前项目会使用全局配置、环境变量、Windsurf DB 自动发现或默认值。`,
+				details: `将删除：${getConfigFilePath("project", ctx.cwd)}\n删除后当前项目会使用全局配置、环境变量或默认值。`,
 			},
 			{ value: "cancel", label: "取消", description: "不删除任何配置。", details: "返回上一级菜单。" },
 		]);
@@ -657,12 +582,6 @@ async function configureScope(ctx: UiContext, scope: FastContextConfigScope): Pr
 	while (true) {
 		const stored = readStoredConfig(scope, ctx.cwd);
 		const choice = await selectConfigItem(ctx, `${scopeName(scope)} fast-context 配置`, [
-			{
-				value: "import-key",
-				label: "自动导入 Windsurf API Key",
-				description: "从 Windsurf state.vscdb 读取 key 并保存。",
-				details: "推荐保存到全局配置。此操作只由人工命令触发，key 只会 masked 展示，不进入 LLM 工具结果。",
-			},
 			...BASIC_CONFIG_FIELDS.map((field) => fieldChoice(field, stored)),
 			{
 				value: "advanced",
@@ -673,8 +592,7 @@ async function configureScope(ctx: UiContext, scope: FastContextConfigScope): Pr
 			{ value: "back", label: "返回", description: "退出当前 scope 配置。", details: "回到上一级菜单。" },
 		]);
 		if (!choice || choice === "back") return;
-		if (choice === "import-key") await importWindsurfKeyFlow(ctx);
-		else if (choice === "advanced") await configureAdvanced(ctx, scope);
+		if (choice === "advanced") await configureAdvanced(ctx, scope);
 		else {
 			const field = BASIC_CONFIG_FIELDS.find((item) => item.key === choice);
 			if (field) await editConfigField(ctx, scope, field);
@@ -691,9 +609,8 @@ async function runConfigWizard(args: string, ctx: UiContext): Promise<void> {
 		await clearConfigFlow(ctx, args);
 		return;
 	}
-	if (lower.includes("import") || lower.includes("auto") || lower.includes("key")) {
-		await importWindsurfKeyFlow(ctx);
-		return;
+	if (lower.includes("import") || lower.includes("auto")) {
+		throw new Error("Windsurf API Key 自动导入已移除。请设置 FAST_CONTEXT_API_KEY 或 WINDSURF_API_KEY，或运行 /fast-context-config 后手动输入 API Key。 ");
 	}
 	const scope = await chooseScope(ctx, args);
 	if (scope) await configureScope(ctx, scope);
@@ -760,7 +677,7 @@ Use fast_context_search early when relevant files, components, implementation fl
 
 Do NOT use it for exact identifier grep, exhaustive reference lists, literal text search, directory listing, reading a known file, or modifying files. Use bash/rg/grep/find/ls/read/edit/write for those jobs when available.
 
-Treat results as navigation hints: read returned files before precise claims or changes. Configuration is handled by /fast-context-config. API key resolution order: FAST_CONTEXT_API_KEY or WINDSURF_API_KEY env > project config > global config > Windsurf state.vscdb auto-discovery.`,
+Treat results as navigation hints: read returned files before precise claims or changes. Configuration is handled by /fast-context-config. API key resolution order: FAST_CONTEXT_API_KEY or WINDSURF_API_KEY env > project config > global config.`,
 		promptSnippet: "Semantic codebase discovery for unknown files, flows, architecture, tests, and project-specific implementation context; returns file paths, line ranges, and grep keywords.",
 		promptGuidelines: [
 			"Use fast_context_search early only when the task needs project-specific context and relevant files, flows, architecture, behavior, or tests are unknown.",
@@ -787,7 +704,7 @@ Treat results as navigation hints: read returned files before precise claims or 
 			const keyInfo = await resolveApiKey(config);
 			if (!keyInfo.apiKey) {
 				ctx.ui.setStatus("fast-context", "fast-context: missing key");
-				throw new Error(`Windsurf API key not found. Run /fast-context-config, set FAST_CONTEXT_API_KEY or WINDSURF_API_KEY, or log in to Windsurf.${keyInfo.error ? `\n${keyInfo.error}` : ""}${keyInfo.hint ? `\n${keyInfo.hint}` : ""}`);
+				throw new Error(`Windsurf API key not found. Run /fast-context-config to enter one, or set FAST_CONTEXT_API_KEY or WINDSURF_API_KEY.${keyInfo.error ? `\n${keyInfo.error}` : ""}${keyInfo.hint ? `\n${keyInfo.hint}` : ""}`);
 			}
 
 			const projectRoot = normalizeProjectPath(params.project_root_path, ctx.cwd);
@@ -895,19 +812,9 @@ Treat results as navigation hints: read returned files before precise claims or 
 	});
 
 	pi.registerCommand("fast-context-config", {
-		description: "Configure pi-fast-context interactively. Usage: /fast-context-config [project|global|clear|import]",
+		description: "Configure pi-fast-context interactively. Usage: /fast-context-config [project|global|clear]",
 		handler: async (args, ctx) => {
 			await runConfigWizard(args, ctx as UiContext);
-		},
-	});
-
-	pi.registerCommand("fast-context-import-key", {
-		description: "Import Windsurf API key from local state.vscdb and persist it after confirmation",
-		handler: async (_args, ctx) => {
-			if ((ctx as UiContext).hasUI === false) {
-				throw new Error("/fast-context-import-key 需要交互式 UI。非交互模式请设置 FAST_CONTEXT_API_KEY 或 WINDSURF_API_KEY。");
-			}
-			await importWindsurfKeyFlow(ctx as UiContext);
 		},
 	});
 

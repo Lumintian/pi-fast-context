@@ -1,15 +1,13 @@
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 
 export type FastContextConfigScope = "project" | "global";
 export type RepoMapMode = "classic" | "bootstrap_hotspot";
-export type ApiKeySource = "env" | "project" | "global" | "windsurf-db" | "none";
+export type ApiKeySource = "env" | "project" | "global" | "none";
 
 export interface StoredFastContextConfig {
 	apiKey?: string;
-	dbPath?: string;
 	treeDepth?: number;
 	maxTurns?: number;
 	maxCommands?: number;
@@ -29,7 +27,6 @@ export interface StoredFastContextConfig {
 export interface FastContextConfig {
 	apiKey?: string;
 	apiKeySource: ApiKeySource;
-	dbPath?: string;
 	treeDepth: number;
 	maxTurns: number;
 	maxCommands: number;
@@ -49,17 +46,9 @@ export interface FastContextConfig {
 export interface ResolvedApiKey {
 	apiKey?: string;
 	source: ApiKeySource;
-	dbPath?: string;
 	error?: string;
 	hint?: string;
 }
-
-type ExtractKeyResult = {
-	api_key?: string;
-	db_path?: string;
-	error?: string;
-	hint?: string;
-};
 
 const DEFAULT_CONFIG = {
 	treeDepth: 0,
@@ -151,7 +140,6 @@ function readStringArraySetting(envName: string, stored: string[] | undefined, f
 export function cleanStoredConfig(config: StoredFastContextConfig): StoredFastContextConfig {
 	const cleaned: StoredFastContextConfig = {};
 	if (config.apiKey) cleaned.apiKey = config.apiKey.trim();
-	if (config.dbPath) cleaned.dbPath = config.dbPath.trim();
 	if (config.treeDepth !== undefined && config.treeDepth >= 0) cleaned.treeDepth = Math.min(6, Math.trunc(config.treeDepth));
 	if (config.maxTurns && config.maxTurns > 0) cleaned.maxTurns = Math.min(10, Math.trunc(config.maxTurns));
 	if (config.maxCommands && config.maxCommands > 0) cleaned.maxCommands = Math.min(20, Math.trunc(config.maxCommands));
@@ -174,7 +162,6 @@ function normalizeStoredConfig(raw: unknown): StoredFastContextConfig {
 	const value = raw as Record<string, unknown>;
 	return cleanStoredConfig({
 		apiKey: maybeString(value.apiKey) ?? maybeString(value.FAST_CONTEXT_API_KEY) ?? maybeString(value.WINDSURF_API_KEY),
-		dbPath: maybeString(value.dbPath) ?? maybeString(value.FAST_CONTEXT_DB_PATH),
 		treeDepth: maybeNonNegativeInt(value.treeDepth) ?? maybeNonNegativeInt(value.FAST_CONTEXT_TREE_DEPTH),
 		maxTurns: maybePositiveInt(value.maxTurns) ?? maybePositiveInt(value.FAST_CONTEXT_MAX_TURNS),
 		maxCommands: maybePositiveInt(value.maxCommands) ?? maybePositiveInt(value.FAST_CONTEXT_MAX_COMMANDS),
@@ -266,7 +253,6 @@ export function loadConfig(cwd: string): FastContextConfig {
 	return {
 		apiKey,
 		apiKeySource,
-		dbPath: readStringSetting("FAST_CONTEXT_DB_PATH", merged.dbPath),
 		treeDepth: Math.min(6, readOptionalIntSetting("FAST_CONTEXT_TREE_DEPTH", merged.treeDepth, DEFAULT_CONFIG.treeDepth, true)),
 		maxTurns: Math.min(10, readOptionalIntSetting("FAST_CONTEXT_MAX_TURNS", merged.maxTurns, DEFAULT_CONFIG.maxTurns)),
 		maxCommands: Math.min(20, readOptionalIntSetting("FAST_CONTEXT_MAX_COMMANDS", merged.maxCommands, DEFAULT_CONFIG.maxCommands)),
@@ -295,37 +281,8 @@ export function validateConfig(config: FastContextConfig): string[] {
 	return issues;
 }
 
-async function extractWindsurfDbKey(dbPath?: string): Promise<ResolvedApiKey> {
-	try {
-		const keyModule = await import(pathToFileURL(path.join(import.meta.dirname, "lib", "extract-key.mjs")).href) as {
-			extractKey: (dbPath?: string) => Promise<ExtractKeyResult>;
-		};
-		const result = await keyModule.extractKey(dbPath);
-		if (result.api_key) {
-			return { apiKey: result.api_key, source: "windsurf-db", dbPath: result.db_path };
-		}
-		if (dbPath) {
-			const fallback = await keyModule.extractKey();
-			if (fallback.api_key) {
-				return { apiKey: fallback.api_key, source: "windsurf-db", dbPath: fallback.db_path };
-			}
-			const fallbackInfo = fallback.error && fallback.db_path !== result.db_path
-				? ` Default Windsurf DB fallback (${fallback.db_path}) also failed: ${fallback.error}`
-				: "";
-			return { source: "none", dbPath: result.db_path, error: `${result.error ?? "Configured Windsurf database did not contain an API key."}${fallbackInfo}`, hint: result.hint ?? fallback.hint };
-		}
-		return { source: "none", dbPath: result.db_path, error: result.error, hint: result.hint };
-	} catch (error) {
-		return { source: "none", dbPath, error: error instanceof Error ? error.message : String(error) };
-	}
-}
-
 export function hasEnvApiKey(): boolean {
 	return Boolean(maybeString(process.env.FAST_CONTEXT_API_KEY) ?? maybeString(process.env.WINDSURF_API_KEY));
-}
-
-export async function discoverWindsurfDbKey(dbPath?: string): Promise<ResolvedApiKey> {
-	return extractWindsurfDbKey(dbPath);
 }
 
 export function persistApiKey(scope: FastContextConfigScope, cwd: string, apiKey: string): string {
@@ -334,10 +291,8 @@ export function persistApiKey(scope: FastContextConfigScope, cwd: string, apiKey
 }
 
 export async function resolveApiKey(config: FastContextConfig): Promise<ResolvedApiKey> {
-	if (config.apiKey) {
-		return { apiKey: config.apiKey, source: config.apiKeySource, dbPath: config.dbPath };
-	}
-	return extractWindsurfDbKey(config.dbPath);
+	if (config.apiKey) return { apiKey: config.apiKey, source: config.apiKeySource };
+	return { source: "none" };
 }
 
 export function maskSecret(value: string | undefined): string {
