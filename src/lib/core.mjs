@@ -16,7 +16,7 @@ import { resolve, join, relative, sep, isAbsolute } from "node:path";
 import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { platform, arch, release, version as osVersion, hostname, cpus, totalmem } from "node:os";
-import treeNodeCli from "tree-node-cli";
+import { tree as treeNodeCli } from "tree-node-cli";
 
 import {
   ProtobufEncoder,
