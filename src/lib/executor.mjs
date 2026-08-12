@@ -10,7 +10,7 @@ import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, existsSyn
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { promisify } from "node:util";
 import { rgPath } from "@vscode/ripgrep";
-import treeNodeCli from "tree-node-cli";
+import { tree as treeNodeCli } from "tree-node-cli";
 
 const execFileAsync = promisify(execFileCb);
 
